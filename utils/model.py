@@ -41,7 +41,7 @@ class FlowModelModuleConfig:
 
     node_embedding_config: 'NodeEmbeddingConfig' = field(init=False)
     edge_embedding_config: 'EdgeEmbeddingConfig' = field(init=False)
-    trunk_config_generator: Callable = field(init=False)
+    trunk_config_generator: Callable[[int], 'FlowModelTrunkConfig'] = field(init=False)
 
     def __post_init__(self):
         self.node_embedding_config = NodeEmbeddingConfig(
@@ -61,10 +61,12 @@ class FlowModelModuleConfig:
             no_qk_points= self.ipa_no_qk_points, no_v_points = self.ipa_no_v_points
         )
 
+        # Create a function that allows us to set final_layer flag for the last trunk block.
         self.trunk_config_generator = lambda layer_idx: FlowModelTrunkConfig(
             single_repr_transformer_atten_heads=self.trunk_transformer_atten_heads,
             single_repr_transformer_num_layers=self.trunk_transformer_num_layers,
-            dropout=self.dropout, final_layer=(layer_idx == self.num_trunk_blocks), ipa_config=ipa_config
+            dropout=self.dropout, ipa_config=ipa_config,
+            final_layer=(layer_idx == (self.num_trunk_blocks - 1)), 
         ) 
 
 

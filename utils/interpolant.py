@@ -59,11 +59,14 @@ class Interpolant:
     def set_device(self, device):
         self._device = device
     
-    def corrupt_batch(self, batch: BatchData) -> BatchData:
+    def corrupt_batch(self, batch: BatchData, t_in: Optional[float] = None) -> BatchData:
         output_batch = deepcopy(batch)
 
         # Sample a value between 0 and 1 for each batch element.
-        t = self.sample_t(batch.batch_size)[:, None] # [B, 1]
+        if t_in is not None:
+            t = torch.tensor([t_in], device=self._device).unsqueeze(0).expand(batch.batch_size, -1)
+        else:
+            t = self.sample_t(batch.batch_size)[:, None] # [B, 1]
         so3_t, r3_t = t, t
 
         # Apply corruptions to each manifold independently.
@@ -87,6 +90,12 @@ class Interpolant:
         return output_batch
     
     def sample(self, model: FlowModel, num_batch: int, num_res: int, num_sample_timesteps: int, self_condition: bool = True):
+        """
+        Returns sampled trajectories:
+        - atom37_traj: The final trajectory of the interpolant varying from t=0 to t=1.
+        - clean_atom37_traj: The trajectory of predictions of t=1 from each time step as N, CA, C, CB, O coords.
+        - clean_traj: The trajectory of predictions of t=1 from each time as translation/rotation frames.
+        """
         if not hasattr(self, "_device"):
             raise ValueError("Device not set, call interpolant.set_device(device) first.")
 
@@ -96,76 +105,62 @@ class Interpolant:
         prot_traj = [(trans_0, rotmats_0)] # Store flow trajectory.
 
         # Set-up time
-        clean_traj = []
+        self_condition_pred = None
         ts = torch.linspace(self.min_t, 1.0, num_sample_timesteps)
-        t_1 = ts[0]
+        t_1 = ts[0] # Current time (t) to predict t=1 from.
+
         ### Integrate forward from t_0 to min_t
+        clean_traj = []
         for t_2 in tqdm(ts[1:], total=num_sample_timesteps-1):
-            # Run model.
+
+            # Create a batch at time t_1 which is initialized with random noise.
             trans_t_1, rotmats_t_1 = prot_traj[-1]
-            sample_batch = self.get_sample_batch_time_t(num_batch, num_res, trans_t_1, rotmats_t_1, t_1)
+            sample_batch = _get_sample_batch_time_t(num_batch, num_res, trans_t_1, rotmats_t_1, t_1, self._device)
+
+            # Use any available self-conditioning information to predict the next step
+            if self_condition and self_condition_pred is not None:
+                sample_batch._set_self_condition(self_condition_pred)
+
+            # Predicts t=1 from t=t_1
             with torch.no_grad():
                 sampling_out = model(sample_batch)
-                
-            if self_condition:
-                sample_batch._set_self_condition(sampling_out.pred_trans)
+            self_condition_pred = sampling_out.pred_trans
             
-            # Process model output.
+            # Record the predicted t=1 coordinates and rotation matrices.
             clean_traj.append((sampling_out.pred_trans.detach().cpu(), sampling_out.pred_rotmats.detach().cpu()))
 
-            # Take reverse step
+            # Interpolate to t_2 along a geodesic defined between t=t_1 and the prediciton for t=1.
             d_t = t_2 - t_1
-            trans_t_2 = self._trans_euler_step(d_t, t_1, sampling_out.pred_trans, trans_t_1)
-            rotmats_t_2 = self._rots_euler_step(d_t, t_1, sampling_out.pred_rotmats, rotmats_t_1)
+            trans_t_2 = _trans_euler_step(d_t, t_1, sampling_out.pred_trans, trans_t_1)
+            rotmats_t_2 = _rots_euler_step(d_t, t_1, sampling_out.pred_rotmats, rotmats_t_1, self.rots_exp_rate)
+
+            # Record the interpolated coordinates which will be used as the trans_t/rotmat_t input to the next step.
             prot_traj.append((trans_t_2, rotmats_t_2))
+
+            # Update the current time to t_2
             t_1 = t_2
 
-        # We only integrated to min_t, so need to make a final step
+        # We only integrated to t=(1 - min_t), so need to make a final step to 1
         t_1 = ts[-1]
         trans_t_1, rotmats_t_1 = prot_traj[-1]
-        sample_batch = self.get_sample_batch_time_t(num_batch, num_res, trans_t_1, rotmats_t_1, t_1)
+        sample_batch = _get_sample_batch_time_t(num_batch, num_res, trans_t_1, rotmats_t_1, t_1, self._device)
+
+        # Use any available self-conditioning information to predict the next step
+        if self_condition and self_condition_pred is not None:
+            sample_batch._set_self_condition(self_condition_pred)
+
+        # Record final samples.
         with torch.no_grad():
             final_out = model(sample_batch)
-        clean_traj.append(
-            (final_out.pred_trans.detach().cpu(), final_out.pred_rotmats.detach().cpu())
-        )
+        clean_traj.append((final_out.pred_trans.detach().cpu(), final_out.pred_rotmats.detach().cpu()))
         prot_traj.append((final_out.pred_trans, final_out.pred_rotmats))
 
-        # Convert trajectories to atom37.
+        # Convert translation/rotations to protein backbone frames.
         atom37_traj = transrot_to_atom37(prot_traj, sample_batch.res_mask)
         clean_atom37_traj = transrot_to_atom37(clean_traj, sample_batch.res_mask)
 
         return atom37_traj, clean_atom37_traj, clean_traj
-
     
-    def get_sample_batch_time_t(self, num_batch, num_res, trans_t, rotmats_t, t):
-        batch = BatchData(
-            batch_size=num_batch,
-            num_res=num_res,
-            res_mask = torch.ones((num_batch, num_res), device=self._device),
-            r_1=None,
-            diffuse_mask=torch.ones((num_batch, num_res), device=self._device),
-            device=self._device,
-            res_indices=torch.arange(num_res, device=self._device),
-        )
-        batch._update_from_corrupt(
-            r_t=Rigid(Rotation(rot_mats=rotmats_t), trans=trans_t),
-            so3_t=torch.full((num_batch, 1), t, device=self._device),
-            r3_t=torch.full((num_batch, 1), t, device=self._device),
-        )
-        return batch
-
-    def _trans_euler_step(self, d_t, t, trans_1, trans_t):
-        # Take linear step towards t=1.
-        trans_vf = (trans_1 - trans_t) / (1 - t)
-        return trans_t + trans_vf * d_t
-    
-    def _rots_euler_step(self, d_t, t, rotmats_1, rotmats_t):
-        # Take exponential step towards t=1.
-        scaling = self.rots_exp_rate
-        return so3_utils.geodesic_t(scaling * d_t, rotmats_1, rotmats_t)
-    
-
     def sample_t(self, num_batch):
         if not hasattr(self, "_device"):
             raise ValueError("Device not set, call interpolant.set_device(device) first.")
@@ -187,14 +182,13 @@ class Interpolant:
         if not hasattr(self, "_device"):
             raise ValueError("Device not set, call interpolant.set_device(device) first.")
         num_batch, num_res = res_mask.shape
-        noisy_rotmats = self.igso3.sample(
-            torch.tensor([1.5]),
-            num_batch*num_res
-        ).to(self._device)
+
+        noisy_rotmats = self.igso3.sample(torch.tensor([1.5]), num_batch*num_res).to(self._device)
         noisy_rotmats = noisy_rotmats.reshape(num_batch, num_res, 3, 3)
-        rotmats_0 = torch.einsum(
-            "...ij,...jk->...ik", r_1, noisy_rotmats)
+
+        rotmats_0 = torch.einsum("...ij,...jk->...ik", r_1, noisy_rotmats)
         rotmats_t = so3_utils.geodesic_t(t[..., None], r_1, rotmats_0)
+
         identity = torch.eye(3, device=self._device)
         rotmats_t = (
             rotmats_t * res_mask[..., None, None]
@@ -216,6 +210,18 @@ def _uniform_so3(num_batch, num_res, device):
     ).reshape(num_batch, num_res, 3, 3)
 
 
+def _trans_euler_step(d_t, t, trans_1, trans_t):
+    # Take linear step towards t=1.
+    trans_vf = (trans_1 - trans_t) / (1 - t)
+    return trans_t + trans_vf * d_t
+
+
+def _rots_euler_step(d_t, t, rotmats_1, rotmats_t, exp_rate):
+    # Take exponential step towards t=1.
+    scaling = exp_rate
+    return so3_utils.geodesic_t(scaling * d_t, rotmats_1, rotmats_t)
+    
+
 def _trans_diffuse_mask(trans_t, trans_1, diffuse_mask):
     return trans_t * diffuse_mask[..., None] + trans_1 * (1 - diffuse_mask[..., None])
 
@@ -225,3 +231,21 @@ def _rots_diffuse_mask(rotmats_t, rotmats_1, diffuse_mask):
         rotmats_t * diffuse_mask[..., None, None]
         + rotmats_1 * (1 - diffuse_mask[..., None, None])
     )
+
+
+def _get_sample_batch_time_t(num_batch, num_res, trans_t, rotmats_t, t, device):
+    batch = BatchData(
+        batch_size=num_batch,
+        num_res=num_res,
+        res_mask = torch.ones((num_batch, num_res), device=device),
+        r_1=None,
+        diffuse_mask=torch.ones((num_batch, num_res), device=device),
+        device=device,
+        res_indices=torch.arange(num_res, device=device),
+    )
+    batch._update_from_corrupt(
+        r_t=Rigid(Rotation(rot_mats=rotmats_t), trans=trans_t),
+        so3_t=torch.full((num_batch, 1), t, device=device),
+        r3_t=torch.full((num_batch, 1), t, device=device),
+    )
+    return batch
