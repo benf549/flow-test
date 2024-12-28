@@ -25,6 +25,7 @@ from utils.dataset import UnclusteredProteinChainDataset, ClusteredDatasetSample
 from utils.model import FlowModel, FlowModelModuleConfig
 from utils.interpolant import Interpolant, InterpolantConfig
 from utils.distributed_training import DistributedSamplerWrapper, setup_distributed
+from utils.adamw_schedulefree import AdamWScheduleFree
 import utils.openfold_rigid_utils as ur 
 import utils.utility_functions as uf
 
@@ -190,7 +191,7 @@ class DistributedModelTrainer():
     def __init__(
         self, device_rank, world_size, flow_model_config, interpolant_config, flow_matching_loss_config, 
         dataset_shelve_path, metadata_shelve_path, device, 
-        learning_rate = 1e-4, use_self_conditioning=True, use_wandb=True, debug=False,
+        learning_rate = 5e-4, use_self_conditioning=True, use_wandb=True, debug=False,
         batch_size=500, max_protein_size=500
     ):
         self.debug = debug
@@ -205,7 +206,8 @@ class DistributedModelTrainer():
         self.flow_matching_loss_config = flow_matching_loss_config
         self.interpolant = Interpolant(interpolant_config)
         self.flow_matching_loss = FlowMatchingLoss(flow_matching_loss_config)
-        self.optimizer = torch.optim.Adam(self.flow_model.parameters(), lr=learning_rate)
+        # self.optimizer = torch.optim.Adam(self.flow_model.parameters(), lr=learning_rate)
+        self.optimizer = AdamWScheduleFree(self.flow_model.parameters(), lr=learning_rate, foreach=False)
         self.dataset = UnclusteredProteinChainDataset(dataset_shelve_path, metadata_shelve_path)
 
         self.device = device
@@ -253,7 +255,7 @@ class DistributedModelTrainer():
             'optimizer_state_dict': self.optimizer.state_dict(),
             'use_self_conditioning': self.use_self_conditioning
         }
-        torch.save(checkpoint_dict, f'./model-checkpoints/checkpoint_epoch_{self.epoch:04d}.pt')
+        torch.save(checkpoint_dict, f'./model-checkpoints/checkpoint_2_epoch_{self.epoch:04d}.pt')
     
     def log(self):
          # Gather the logging data from all processes.
@@ -279,6 +281,7 @@ class DistributedModelTrainer():
 
     def train_epoch(self):
         self.flow_model.train()
+        self.optimizer.train()
 
         debug_break_flag = True
         for idx, batch in enumerate(tqdm(self.train_dataloader, total=len(self.train_dataloader), dynamic_ncols=True, desc=f'Training Epoch {self.epoch}', disable=(self.device_rank != 0))):
@@ -318,6 +321,7 @@ class DistributedModelTrainer():
     @torch.no_grad()
     def sample_model(self, n_samples, sample_length, sample_timesteps):
         self.flow_model.eval()
+        self.optimizer.eval()
 
         # Only sample from the master process.
         if not self.device_rank == 0:
@@ -374,10 +378,10 @@ if __name__ == "__main__":
     params = {
         'dataset_shelve_path': file_path / 'laser_training_database' / 'all_data_shelf_hbond_sconly_rigorous.db',
         'metadata_shelve_path': file_path / 'laser_training_database' / 'pdb_metadata_shelf_addhaslig_perchain.db',
-        'num_epochs': 500,
-        'num_samples': 1,
-        'sample_length': 128,
-        'sample_timesteps': 100,
+        'num_epochs': 1000,
+        'num_samples': 2,
+        'sample_length': 256,
+        'sample_timesteps': 1000,
         'master_port': '56889'
     }
     world_size = len(VISIBLE_DEVICES)
