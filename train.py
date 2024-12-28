@@ -15,6 +15,7 @@ from utils.flow_matching_loss import FlowMatchingLossConfig, FlowMatchingLoss
 from utils.dataset import UnclusteredProteinChainDataset, ClusteredDatasetSampler, idealize_backbone_coords, BatchData, ModelOutput
 from utils.model import FlowModel, FlowModelModuleConfig
 from utils.interpolant import Interpolant, InterpolantConfig
+from utils.adamw_schedulefree import AdamWScheduleFree
 import utils.openfold_rigid_utils as ur 
 import utils.utility_functions as uf
 
@@ -127,20 +128,23 @@ class ModelTrainer():
     def __init__(
         self, flow_model_config, interpolant_config, flow_matching_loss_config, 
         dataset_shelve_path, metadata_shelve_path, device, 
-        learning_rate = 1e-4, use_self_conditioning=True, use_wandb=True, debug=False
+        learning_rate = 1e-4, use_self_conditioning=True, use_wandb=False, debug=True
     ):
         self.debug = debug
         self.flow_model = FlowModel(flow_model_config)
         self.interpolant = Interpolant(interpolant_config)
         self.flow_matching_loss = FlowMatchingLoss(flow_matching_loss_config)
-        self.optimizer = torch.optim.Adam(self.flow_model.parameters(), lr=learning_rate)
+        #  self.optimizer = torch.optim.Adam(self.flow_model.parameters(), lr=learning_rate)
+        self.optimizer = AdamWScheduleFree(self.flow_model.parameters(), lr=1e-3, foreach=False)
         self.dataset = UnclusteredProteinChainDataset(dataset_shelve_path, metadata_shelve_path)
 
         self.train_clustered_dataset_sampler = ClusteredDatasetSampler(
             self.dataset, is_test_dataset_sampler=False, batch_size=1000,
             sample_randomly=True, max_protein_size=750, 
-            clustering_dataframe_path='/nfs/polizzi/bfry/laser_clusters_remove_bromo.pkl',
-            subcluster_pickle_path= '/nfs/polizzi/bfry/laser_paper_analyses/pytorch_ligandmpnn_sampler/clusters_to_subcluster_data.pkl',
+            #  clustering_dataframe_path='/nfs/polizzi/bfry/laser_clusters_remove_bromo.pkl',
+            #  subcluster_pickle_path= '/nfs/polizzi/bfry/laser_paper_analyses/pytorch_ligandmpnn_sampler/clusters_to_subcluster_data.pkl',
+            clustering_dataframe_path='./dataset/clustering_dataframe.pkl',
+            subcluster_pickle_path= './dataset/subcluster_pickle.pkl',
             debug=False, seed=None, subset_pdb_code_list=None
         )
         self.train_dataloader = DataLoader(
@@ -190,6 +194,7 @@ class ModelTrainer():
 
     def train_epoch(self):
         self.flow_model.train()
+        self.optimizer.train()
 
         for batch in tqdm(self.train_dataloader, total=len(self.train_dataloader), dynamic_ncols=True, desc=f'Training Epoch {self.epoch}'):
             self.optimizer.zero_grad()
@@ -225,6 +230,7 @@ class ModelTrainer():
 
     def sample_model(self, n_samples):
         self.flow_model.eval()
+        self.optimizer.eval()
         sample_trajectory, clean_sample_trajectory, clean_traj = self.interpolant.sample(self.flow_model, n_samples, 100, 10)
         return sample_trajectory, clean_sample_trajectory
 
@@ -232,7 +238,7 @@ class ModelTrainer():
 def main(params, num_epochs=500):
     trainer = ModelTrainer(
         FLOW_MODEL_CONFIG, INTERPOLANT_CONFIG, FLOW_MATCHING_LOSS_CONFIG, 
-        params['dataset_shelve_path'], params['metadata_shelve_path'], 'cuda:7'
+        params['dataset_shelve_path'], params['metadata_shelve_path'], 'cpu'
     )
 
     for _ in range(num_epochs):
@@ -243,10 +249,10 @@ def main(params, num_epochs=500):
 
 
 if __name__ == "__main__":
-    file_path = Path('..')
-    print((str(file_path.resolve() / 'laser_training_database' / 'all_data_shelf_hbond_sconly_rigorous.db')))
+    file_path = Path('./dataset').resolve()
+    #  print((str(file_path.resolve() / 'laser_training_database' / 'all_data_shelf_hbond_sconly_rigorous.db')))
     params = {
-        'dataset_shelve_path': file_path / 'laser_training_database' / 'all_data_shelf_hbond_sconly_rigorous.db',
-        'metadata_shelve_path': file_path / 'laser_training_database' / 'pdb_metadata_shelf_addhaslig_perchain.db',
+        'dataset_shelve_path': file_path / 'dataset_shelve',
+        'metadata_shelve_path': file_path / 'metadata_shelve',
     }
     main(params)
