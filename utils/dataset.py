@@ -208,15 +208,21 @@ class ClusteredDatasetSampler(Sampler):
         self.max_protein_length = max_protein_size
 
         self.subset_pdb_code_set = set(subset_pdb_code_list) if subset_pdb_code_list is not None else {}
+        if debug:
+            self.subset_pdb_code_set = {'6w70'}
 
         # Load the cluster data.
         sequence_clusters = pd.read_pickle(clustering_dataframe_path)
 
-        if debug:
-            sequence_clusters = sequence_clusters[sequence_clusters.chain.str.find('w7') == 1]
+        # if debug:
+        #    sequence_clusters = sequence_clusters[sequence_clusters.chain.str.find('w7') == 1]
 
-        train_cluster_meta = sequence_clusters[sequence_clusters.is_train & (~sequence_clusters.contaminated) & (~sequence_clusters.strep_structural_chain_contam) & (~sequence_clusters.strep_structural_bioa_contam)]
-        test_cluster_meta = sequence_clusters[(~sequence_clusters.is_train) & (~sequence_clusters.contaminated) & (~sequence_clusters.strep_structural_chain_contam) & (~sequence_clusters.strep_structural_bioa_contam)]
+        if debug:
+            train_cluster_meta = sequence_clusters
+            test_cluster_meta = sequence_clusters
+        else:
+            train_cluster_meta = sequence_clusters[sequence_clusters.is_train & (~sequence_clusters.contaminated) & (~sequence_clusters.strep_structural_chain_contam) & (~sequence_clusters.strep_structural_bioa_contam)]
+            test_cluster_meta = sequence_clusters[(~sequence_clusters.is_train) & (~sequence_clusters.contaminated) & (~sequence_clusters.strep_structural_chain_contam) & (~sequence_clusters.strep_structural_bioa_contam)]
 
         if soluble_proteins_only:
             if len(self.subset_pdb_code_set) > 0:

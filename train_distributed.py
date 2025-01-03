@@ -9,7 +9,6 @@ from dataclasses import dataclass, asdict
 # MUST BE BECORE IMPORTING TORCH
 VISIBLE_DEVICES = ['cuda:0', 'cuda:1', 'cuda:2', 'cuda:3', 'cuda:4', 'cuda:5', 'cuda:6', 'cuda:7']
 os.environ['CUDA_VISIBLE_DEVICES'] = ','.join([x.split(':')[-1] for x in VISIBLE_DEVICES])
-os.environ['CUDA_LAUNCH_BLOCKING'] = '0'
 
 import torch
 import wandb
@@ -71,7 +70,7 @@ FLOW_MATCHING_LOSS_CONFIG = FlowMatchingLossConfig(
     trans_scale = 0.1,
     translation_loss_weight = 2.0,
     rotation_loss_weights = 1.0,
-    aux_loss_weight = 0.0,
+    aux_loss_weight = 1.0,
     aux_loss_use_bb_loss = True,
     aux_loss_use_pair_loss = True,
     aux_loss_t_pass = 0.5,
@@ -110,7 +109,8 @@ def sampled_gly_coords_to_prody_prot(coords):
     return output_protein
 
 
-def collate_fn(data_list: List[dict]) -> BatchData:
+def collate_fn(data_list: List[dict], device_idx: int) -> BatchData:
+    device = torch.device(f'cuda:{device_idx}')
     max_length = 0
     all_batch_data = []
     for batch_idx, (complex_data, chain_key) in enumerate(data_list):
@@ -119,27 +119,21 @@ def collate_fn(data_list: List[dict]) -> BatchData:
         all_residue_frames = []
         curr_pdb_code = complex_data['pdb_code']
         for curr_chain_tup, chain_data in complex_data.items():
-
             if not isinstance(curr_chain_tup, tuple):
                 continue
 
             is_sampled_chain = tuple(chain_key.split('-')[-2:]) == curr_chain_tup
-
-            ideal_bb_coords = idealize_backbone_coords(chain_data['backbone_coords'].float(), chain_data['phi_psi_angles'])
-            ca_com = uf.compute_center_of_mass(ideal_bb_coords[:, 1])
-            centered_ideal_bb_coords = uf.center_coords(ideal_bb_coords, ca_com)
-            centered_ideal_bb_coords = centered_ideal_bb_coords @ torch.from_numpy(scipy_rot.random().as_matrix().T).float()
-            frames = uf.compute_residue_frames(centered_ideal_bb_coords)
-
-            complex_len += centered_ideal_bb_coords.shape[0]
-            all_residue_frames.append(frames)
-            all_backbone_coords.append(centered_ideal_bb_coords)
+            bb_coords = chain_data['backbone_coords'].float().to(device)
+            phi_psi_angles = chain_data['phi_psi_angles'].to(device)
+            ideal_bb_coords = idealize_backbone_coords(bb_coords, phi_psi_angles)
+            complex_len += ideal_bb_coords.shape[0]
+            all_backbone_coords.append(ideal_bb_coords)
 
         max_length = max(max_length, complex_len)
         complex_coords = torch.cat(all_backbone_coords, dim=0)
-        complex_frames = torch.cat(all_residue_frames, dim=0)
-        pre_padding_mask = torch.ones(complex_coords.shape[0])
-
+        complex_com = uf.center_coords(complex_coords, uf.compute_center_of_mass(complex_coords[:, 1]))
+        complex_frames = uf.compute_residue_frames(complex_com)
+        pre_padding_mask = torch.ones(complex_coords.shape[0], device=device)
         all_batch_data.append((complex_coords, complex_frames, pre_padding_mask))
 
     # Pad the first dimension of the data to the max length.
@@ -165,8 +159,8 @@ def collate_fn(data_list: List[dict]) -> BatchData:
         diffuse_mask = padded_masks,
         batch_size = padded_coords.shape[0],
         num_res = padded_coords.shape[1],
-        res_indices = torch.arange(padded_coords.shape[1]).unsqueeze(0).expand(padded_coords.shape[0], -1),
-        device=torch.device('cpu')
+        res_indices = torch.arange(padded_coords.shape[1], device=device).unsqueeze(0).expand(padded_coords.shape[0], -1),
+        device=device
     )
     
 
@@ -191,8 +185,8 @@ class DistributedModelTrainer():
     def __init__(
         self, device_rank, world_size, flow_model_config, interpolant_config, flow_matching_loss_config, 
         dataset_shelve_path, metadata_shelve_path, device, 
-        learning_rate = 5e-4, use_self_conditioning=True, use_wandb=True, debug=False,
-        batch_size=500, max_protein_size=500
+        learning_rate = 1e-4, use_self_conditioning=True, use_wandb=True, debug=False,
+        batch_size=1000, max_protein_size=250, grad_accum_steps=3
     ):
         self.debug = debug
         self.device_rank = device_rank
@@ -200,14 +194,15 @@ class DistributedModelTrainer():
 
         self.batch_size = batch_size
         self.max_protein_size = max_protein_size
+        self.grad_accum_steps = grad_accum_steps
 
         self.flow_model = FlowModel(flow_model_config)
         self.interpolant_config = interpolant_config
         self.flow_matching_loss_config = flow_matching_loss_config
         self.interpolant = Interpolant(interpolant_config)
         self.flow_matching_loss = FlowMatchingLoss(flow_matching_loss_config)
-        # self.optimizer = torch.optim.Adam(self.flow_model.parameters(), lr=learning_rate)
-        self.optimizer = AdamWScheduleFree(self.flow_model.parameters(), lr=learning_rate, foreach=False)
+        self.optimizer = torch.optim.Adam(self.flow_model.parameters(), lr=learning_rate)
+        # self.optimizer = AdamWScheduleFree(self.flow_model.parameters(), lr=learning_rate, foreach=False)
         self.dataset = UnclusteredProteinChainDataset(dataset_shelve_path, metadata_shelve_path)
 
         self.device = device
@@ -241,12 +236,14 @@ class DistributedModelTrainer():
             'subcluster_pickle_path': '/nfs/polizzi/bfry/laser_paper_analyses/pytorch_ligandmpnn_sampler/clusters_to_subcluster_data.pkl',
             'debug': False, 'subset_pdb_code_list': None
         }
-        return prepare_dataloader(self.device_rank, self.world_size, data_loader_kwargs, self.epoch, self.dataset, collate_fn)
+        return prepare_dataloader(
+            self.device_rank, self.world_size, data_loader_kwargs, 
+            self.epoch, self.dataset, lambda x: collate_fn(x, device_idx=self.device_rank)
+        )
 
     def checkpoint(self):
         if not self.device_rank == 0:
             return
-
         checkpoint_dict = {
             'epoch': self.epoch,
             'flow_model_state_dict': self.flow_model.module.state_dict(),
@@ -257,6 +254,16 @@ class DistributedModelTrainer():
         }
         torch.save(checkpoint_dict, f'./model-checkpoints/checkpoint_2_epoch_{self.epoch:04d}.pt')
     
+    def load_from_checkpoint(self, checkpoint_path: Optional[Tuple[Path, str]]):
+        if checkpoint_path is not None:
+            checkpoint_dict = torch.load(checkpoint_path)
+            self.epoch = checkpoint_dict['epoch']
+            self.flow_model.module.load_state_dict(checkpoint_dict['flow_model_state_dict'])
+            self.interpolant_config = InterpolantConfig(**checkpoint_dict['interpolant_config'])
+            self.flow_matching_loss_config = FlowMatchingLossConfig(**checkpoint_dict['flow_matching_loss_config'])
+            self.optimizer.load_state_dict(checkpoint_dict['optimizer_state_dict'])
+            self.use_self_conditioning = checkpoint_dict['use_self_conditioning']
+
     def log(self):
          # Gather the logging data from all processes.
         all_logging_data = [None for _ in range(self.world_size)]
@@ -281,9 +288,10 @@ class DistributedModelTrainer():
 
     def train_epoch(self):
         self.flow_model.train()
-        self.optimizer.train()
+        # self.optimizer.train()
 
         debug_break_flag = True
+        grad_accum_num_steps = 0
         for idx, batch in enumerate(tqdm(self.train_dataloader, total=len(self.train_dataloader), dynamic_ncols=True, desc=f'Training Epoch {self.epoch}', disable=(self.device_rank != 0))):
             if self.debug and not debug_break_flag:
                 break
@@ -306,22 +314,24 @@ class DistributedModelTrainer():
             model_out = self.flow_model(corrupt_batch)
             batch_losses = self.flow_matching_loss.compute_flow_matching_loss(corrupt_batch, model_out, reduce='mean')
             batch_losses.se3_vf_loss.backward()
-            self.optimizer.step()
+            if grad_accum_num_steps > self.grad_accum_steps:
+                self.optimizer.step()
+                debug_break_flag = False
+                grad_accum_num_steps = 0
+
+            grad_accum_num_steps += 1
 
             # Record the losses for the current batch.
             for loss_component, loss in batch_losses.__dict__.items():
                 self.training_epoch_metadata[loss_component].append(loss.item())
 
-            if idx == 4:
-                debug_break_flag = False
-            
         self.epoch += 1
         self.train_dataloader = self.get_dataloader()
 
     @torch.no_grad()
     def sample_model(self, n_samples, sample_length, sample_timesteps):
         self.flow_model.eval()
-        self.optimizer.eval()
+        # self.optimizer.eval()
 
         # Only sample from the master process.
         if not self.device_rank == 0:
@@ -362,6 +372,7 @@ def main(rank, world_size, params):
         rank, world_size, FLOW_MODEL_CONFIG, INTERPOLANT_CONFIG, FLOW_MATCHING_LOSS_CONFIG, 
         params['dataset_shelve_path'], params['metadata_shelve_path'], f'cuda:{rank}'
     )
+    trainer.load_from_checkpoint(params['checkpoint_path'])
 
     for _ in range(params['num_epochs']):
         trainer.train_epoch()
@@ -378,8 +389,10 @@ if __name__ == "__main__":
     params = {
         'dataset_shelve_path': file_path / 'laser_training_database' / 'all_data_shelf_hbond_sconly_rigorous.db',
         'metadata_shelve_path': file_path / 'laser_training_database' / 'pdb_metadata_shelf_addhaslig_perchain.db',
+        # 'checkpoint_path': '/nfs/polizzi/bfry/flow-test/model-checkpoints/checkpoint_2_epoch_0680.pt',
+        'checkpoint_path': None,
         'num_epochs': 1000,
-        'num_samples': 2,
+        'num_samples': 1,
         'sample_length': 256,
         'sample_timesteps': 1000,
         'master_port': '56889'
