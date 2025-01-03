@@ -7,7 +7,8 @@ from collections import defaultdict
 from dataclasses import dataclass, asdict
 
 # MUST BE BECORE IMPORTING TORCH
-VISIBLE_DEVICES = ['cuda:0', 'cuda:1', 'cuda:2', 'cuda:3', 'cuda:4', 'cuda:5', 'cuda:6', 'cuda:7']
+# VISIBLE_DEVICES = ['cuda:0', 'cuda:1', 'cuda:2', 'cuda:3', 'cuda:4', 'cuda:5', 'cuda:6', 'cuda:7']
+VISIBLE_DEVICES = ['cuda:2', 'cuda:3', 'cuda:6', 'cuda:7']
 os.environ['CUDA_VISIBLE_DEVICES'] = ','.join([x.split(':')[-1] for x in VISIBLE_DEVICES])
 
 import torch
@@ -30,6 +31,37 @@ import utils.utility_functions as uf
 
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel
+
+
+@dataclass
+class DistributedTrainingParams:
+    dataset_shelve_path: str
+    metadata_shelve_path: str
+    checkpoint_path: Optional[Union[str, os.PathLike]] = None
+    num_epochs: int = 1000
+    num_samples: int = 1
+    sample_length: int = 128
+    sample_timesteps: int = 1000
+    master_port: str = '56889'
+
+
+@dataclass
+class TrainerParams:
+    device_rank: int
+    world_size: int
+    flow_model_config: FlowModelModuleConfig
+    interpolant_config: InterpolantConfig
+    flow_matching_loss_config: FlowMatchingLossConfig
+    dataset_shelve_path: Union[str, os.PathLike]
+    metadata_shelve_path: Union[str, os.PathLike]
+    device: torch.device
+    learning_rate: float = 1e-4
+    use_self_conditioning: bool = True
+    use_wandb: bool = False
+    debug: bool = True
+    batch_size: int = 1000
+    max_protein_size: int = 250
+    grad_accum_steps: int = 3
 
 
 FLOW_MODEL_CONFIG = FlowModelModuleConfig(
@@ -182,50 +214,44 @@ def prepare_dataloader(rank, world_size, kwargs_dict, epoch_num, dataset, collat
 
 
 class DistributedModelTrainer():
-    def __init__(
-        self, device_rank, world_size, flow_model_config, interpolant_config, flow_matching_loss_config, 
-        dataset_shelve_path, metadata_shelve_path, device, 
-        learning_rate = 1e-4, use_self_conditioning=True, use_wandb=True, debug=False,
-        batch_size=1000, max_protein_size=250, grad_accum_steps=3
-    ):
-        self.debug = debug
-        self.device_rank = device_rank
-        self.world_size = world_size
+    def __init__(self, trainer_params: TrainerParams):
+        self.debug = trainer_params.debug
+        self.device_rank = trainer_params.device_rank
+        self.world_size = trainer_params.world_size
 
-        self.batch_size = batch_size
-        self.max_protein_size = max_protein_size
-        self.grad_accum_steps = grad_accum_steps
+        self.batch_size = trainer_params.batch_size
+        self.max_protein_size = trainer_params.max_protein_size
+        self.grad_accum_steps = trainer_params.grad_accum_steps
 
-        self.flow_model = FlowModel(flow_model_config)
-        self.interpolant_config = interpolant_config
-        self.flow_matching_loss_config = flow_matching_loss_config
-        self.interpolant = Interpolant(interpolant_config)
-        self.flow_matching_loss = FlowMatchingLoss(flow_matching_loss_config)
-        self.optimizer = torch.optim.Adam(self.flow_model.parameters(), lr=learning_rate)
+        self.flow_model = FlowModel(trainer_params.flow_model_config)
+        self.interpolant_config = trainer_params.interpolant_config
+        self.flow_matching_loss_config = trainer_params.flow_matching_loss_config
+        self.interpolant = Interpolant(trainer_params.interpolant_config)
+        self.flow_matching_loss = FlowMatchingLoss(self.flow_matching_loss_config)
+
+        self.learning_rate = trainer_params.learning_rate
+        self.dataset = UnclusteredProteinChainDataset(trainer_params.dataset_shelve_path, trainer_params.metadata_shelve_path)
+
+        self.device = trainer_params.device
+        self.interpolant.set_device(self.device)
+        self.flow_model = self.flow_model.to(self.device)
+        self.flow_model = DistributedDataParallel(self.flow_model, device_ids=[self.device_rank], output_device=self.device_rank)
+
         # self.optimizer = AdamWScheduleFree(self.flow_model.parameters(), lr=learning_rate, foreach=False)
-        self.dataset = UnclusteredProteinChainDataset(dataset_shelve_path, metadata_shelve_path)
+        self.optimizer = torch.optim.Adam(self.flow_model.parameters(), lr=self.learning_rate)
 
-        self.device = device
-        self.interpolant.set_device(device)
-        self.flow_model = self.flow_model.to(device)
-        self.flow_model = DistributedDataParallel(self.flow_model, device_ids=[device_rank], output_device=device_rank)
-
-        self.learning_rate = learning_rate
-        self.use_self_conditioning = use_self_conditioning
+        self.use_self_conditioning = trainer_params.use_self_conditioning
 
         self.epoch = 0
         self.training_epoch_metadata = defaultdict(list)
         self.validation_epoch_metadata = defaultdict(list)
-
         self.train_dataloader = self.get_dataloader()
 
-        self.use_wandb = use_wandb
-        if use_wandb and device_rank == 0:
+        self.use_wandb = trainer_params.use_wandb
+        if self.use_wandb and self.device_rank == 0:
             wandb_config = {}
-            wandb_config.update(asdict(flow_model_config))
-            wandb_config.update(asdict(interpolant_config))
-            wandb_config.update(asdict(flow_matching_loss_config))
-            wandb_config.update({'learning_rate': learning_rate, 'use_self_conditioning': use_self_conditioning, 'visible_devices': VISIBLE_DEVICES})
+            wandb_config.update(asdict(trainer_params))
+            wandb_config.update({'learning_rate': self.learning_rate, 'use_self_conditioning': self.use_self_conditioning, 'visible_devices': VISIBLE_DEVICES})
 
             wandb.init(project='laser-flow', entity='benf549', config=wandb_config)
     
@@ -234,7 +260,7 @@ class DistributedModelTrainer():
             'batch_size': self.batch_size, 'sample_randomly': True, 'max_protein_size': self.max_protein_size,
             'clustering_dataframe_path': '/nfs/polizzi/bfry/laser_clusters_remove_bromo.pkl',
             'subcluster_pickle_path': '/nfs/polizzi/bfry/laser_paper_analyses/pytorch_ligandmpnn_sampler/clusters_to_subcluster_data.pkl',
-            'debug': False, 'subset_pdb_code_list': None
+            'debug': True, 'subset_pdb_code_list': None
         }
         return prepare_dataloader(
             self.device_rank, self.world_size, data_loader_kwargs, 
@@ -364,38 +390,28 @@ class DistributedModelTrainer():
                 f.write(output_str.getvalue())
 
 
-def main(rank, world_size, params):
+def main(rank, world_size, params: DistributedTrainingParams):
     # Initialize process group.
-    setup_distributed(rank, world_size, params['master_port'])
-
+    setup_distributed(rank, world_size, params.master_port)
     trainer = DistributedModelTrainer(
-        rank, world_size, FLOW_MODEL_CONFIG, INTERPOLANT_CONFIG, FLOW_MATCHING_LOSS_CONFIG, 
-        params['dataset_shelve_path'], params['metadata_shelve_path'], f'cuda:{rank}'
+        TrainerParams(rank, world_size, FLOW_MODEL_CONFIG, INTERPOLANT_CONFIG, FLOW_MATCHING_LOSS_CONFIG, params.dataset_shelve_path, params.metadata_shelve_path, torch.device(f'cuda:{rank}'))
     )
-    trainer.load_from_checkpoint(params['checkpoint_path'])
+    trainer.load_from_checkpoint(params.checkpoint_path)
 
-    for _ in range(params['num_epochs']):
+    for _ in range(params.num_epochs):
         trainer.train_epoch()
         trainer.log()
         if (trainer.epoch % 10 == 0):
             if not trainer.debug:
                 trainer.checkpoint()
-            trainer.sample_model(params['num_samples'], params['sample_length'], params['sample_timesteps'])
+            trainer.sample_model(params.num_samples, params.sample_length, params.sample_timesteps)
 
 
 if __name__ == "__main__":
     file_path = Path('..')
-    print((str(file_path.resolve() / 'laser_training_database' / 'all_data_shelf_hbond_sconly_rigorous.db')))
-    params = {
-        'dataset_shelve_path': file_path / 'laser_training_database' / 'all_data_shelf_hbond_sconly_rigorous.db',
-        'metadata_shelve_path': file_path / 'laser_training_database' / 'pdb_metadata_shelf_addhaslig_perchain.db',
-        # 'checkpoint_path': '/nfs/polizzi/bfry/flow-test/model-checkpoints/checkpoint_2_epoch_0680.pt',
-        'checkpoint_path': None,
-        'num_epochs': 1000,
-        'num_samples': 1,
-        'sample_length': 256,
-        'sample_timesteps': 1000,
-        'master_port': '56889'
-    }
     world_size = len(VISIBLE_DEVICES)
-    mp.spawn(main, args=(world_size, params), nprocs=world_size)
+    training_params = DistributedTrainingParams(
+        dataset_shelve_path = str(file_path.resolve() / 'laser_training_database' / 'all_data_shelf_hbond_sconly_rigorous.db'),
+        metadata_shelve_path = str(file_path.resolve() / 'laser_training_database' / 'pdb_metadata_shelf_addhaslig_perchain.db'),
+    )
+    mp.spawn(main, args=(world_size, training_params), nprocs=world_size)
